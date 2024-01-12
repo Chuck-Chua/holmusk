@@ -1,0 +1,347 @@
+---
+title: "Holmusk take-home challenge"
+author: "Chuck"
+date: "`r format(Sys.time(), '%d %B, %Y (%a)')`"
+output:
+    html_document:
+        code_folding: hide
+        df_print: paged
+        highlight: kate
+        number_sections: yes
+        theme: yeti
+        toc: yes
+        toc_float: yes
+---
+ 
+
+```{r, include=FALSE}
+# Load libaries 
+library("tidyverse")
+library("readxl")
+library("magrittr")
+library("janitor")
+library("flextable")
+library("broom")
+library("gt")
+library("huxtable")
+```
+
+```{r, include=FALSE}
+# Load data 
+df_demographics <- 
+  read_csv("demographics.csv")
+
+df_clinical_data <- 
+  read_csv("clinical_data.csv")
+
+df_bill_id <- 
+  read_csv("bill_id.csv")
+
+df_bill_amount <- 
+  read_csv("bill_amount.csv")
+```
+
+ 
+```{r, include=FALSE}
+#Clean data
+
+#I use a series of merges to combine all the data into a single data frame. 
+#
+# - Merge bill_id and bill_amount at the bill_id level. All rows are preserved and no instances #of duplicate bill_ids. 
+# - Summarize bill amounts at the patient x day of admission level to merge with the clinical #data dataset 
+# - Merge clinical data with demographics data by patient id 
+# - Merge clinical data with bill amounts at the patient x day of admission level 
+
+df_bill_id %<>%
+  left_join(df_bill_amount, by = "bill_id") 
+  
+df_bill_id %<>% 
+  group_by(patient_id, date_of_admission) %>%
+  summarise(amount = sum(amount)) %>%
+  ungroup()
+
+df_clinical_data %<>%
+  left_join(df_demographics, by = c("id" = "patient_id"))
+
+df <-
+df_clinical_data %>%
+  rename(patient_id = id) %>%
+  mutate(date_of_admission = dmy(date_of_admission), 
+         date_of_discharge = dmy(date_of_discharge),
+         date_of_birth = ymd(date_of_birth)) %>%
+  left_join(df_bill_id, by = c("patient_id", "date_of_admission"))
+```
+
+
+```{r, include=FALSE}
+#Create new features
+df %<>%
+  mutate(length_of_stay = interval(date_of_admission, date_of_discharge)/ddays(1),
+         age = interval(date_of_birth, date_of_admission)/dyears(1),
+         ) 
+```
+
+
+```{r, include=FALSE}
+#Clean factor variables
+df %<>%
+  mutate(gender = ifelse(gender == "f", "Female", gender),
+         gender = ifelse(gender == "m", "Male", gender)) 
+
+df %<>%
+  mutate(race = ifelse(race == "India", "Indian", race),
+         race = ifelse(race == "chinese", "Chinese", race)) 
+
+df %<>%
+  mutate(resident_status = ifelse(resident_status == "Singapore citizen", "Singaporean", resident_status))
+
+df %<>%
+  mutate(medical_history_hbp = ifelse(medical_history_hbp == "Yes", "1", medical_history_hbp),
+         medical_history_hbp = ifelse(medical_history_hbp == "No", "0", medical_history_hbp),
+         medical_history_hbp = as.numeric(medical_history_hbp))
+```
+
+### Data description and motivation 
+
+ - Electronic health record (EHR) dataset of 3,000 patients who received mental healthcare for MDD in a real-world hospital system, between 1/1/2011 and 31/12/2011. 
+- Treatment patterns were captured at the class level, split into 6 broad categories - antidepressants, psychotherapy, anticonvulsants, anxiolytics, selective serotonin reuptake inhibitors (SSRIs), and other psychiatric medications (e.g., hypnotics)
+ - My research will describe the current pharmacological treatment patterns for the treatment of depression and examine whether co-prescription tends to result in stronger patient outcomes for those who are presribed antidepressants. 
+
+ 
+### A large majority of patients are prescribed antidepressants or psychotherapy
+
+  - The data contains 6 types of treatments, with antidepressants (82%) and psychotherapy (82%) being the most common treatment.
+  - By contrast, anxiolytics and SSRIs were less common, with 52% and 50% of the cohort using them, respectively. 
+  - There is no information on the timing of treatment. As such, it is unclear how an individual switching treatments will be coded. There is also no enough information on the bills data to identify specific types of medications. A key assumption for the analysis will be that the treatments are mutually exclusive, for example the antidepressants indicator does not include SSRIs as a class of antidepressants. 
+ 
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+df %>%
+  select(contains("trt")) %>%
+  summarise_all(mean) %>%
+  rename(
+    Anxiolytics = 'trt_anx',
+    Anticonvulsants = 'trt_con',
+    Antidepressants = 'trt_adt',
+    SSRI = 'trt_ssr',
+    Psychotherapy = 'trt_the',
+    `Other psychiatric medications` = 'trt_oth'
+  ) %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(percent = V1*100, 
+         label = paste0(round(percent, 0), "%")) %>%
+  rownames_to_column() %>%
+  arrange(desc(percent)) %>%
+  mutate(rowname = fct_reorder(rowname, percent)) %>%
+  ggplot(aes(x = rowname, y = percent)) +
+  geom_col() +
+  geom_text(aes(label = label), 
+            hjust = 3) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Treatment types by frequency(%)") +
+  xlab("") +
+  ylab("")
+```
+
+### Most patients are treated through multiple means
+ 
+ - Treatment with a combination of classes is common, with 92% of the treated receiving ≥3 different classes of therapy, and a 70% of the treated receiving 4 or more. This is likely because individuals who do not respond to an antidepressant therapy may be co-prescribed an adjunctive medication (e.g., anticonvulsant) alongside their antidepressant to help improve their symptoms.
+ -  Accordingly, the average bill amount and improvement in CGI-Severity (CGIS) score is slightly increasing with the number of treatments.  
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+df %>%
+  mutate(n_treatments = trt_adt + trt_anx + trt_con + trt_ssr + trt_the + trt_oth) %>%
+  group_by(n_treatments) %>%
+  summarise(count = n(), 
+            average_cost = amount %>% mean() %>% round(0),
+            cgis_improvement = -mean(cgis_dis - cgis_adm) %>% round(2)) %>%
+  ungroup() %>%
+  mutate(percent = round(100*count/sum(count), 0) %>% paste0("%"),
+         count = paste0(count, " (", percent, ")"),
+         average_cost = prettyNum(average_cost, big.mark = ",") %>% paste0("$", .)) %>%
+  select(-percent) %>%
+  rename(
+    `Number of Treatments` = n_treatments,
+    Count = count,
+    `Average Bill Amount` = average_cost,
+    `Decrease in CGIS Score` = cgis_improvement
+  ) %>%
+  gt() 
+```
+
+### No particular class of treatment is predominantly used given patients' medical histories. This likely reflects the synthetic nature of the data. 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+get_summary_stats <- function(df, trt_var) {
+  trt_var <- enquo(trt_var)
+  
+  df %>%
+    group_by(!!trt_var) %>%
+    summarise(across(contains("history"), list(mean = ~mean(., na.rm = TRUE), sd = ~sd(., na.rm = TRUE)),
+                     .names = "{col}_{fn}")) %>%
+    ungroup() %>%
+    pivot_longer(cols = -!!trt_var, names_to = c("history", ".value"), names_pattern = "(.+)_(.+)$")  %>%
+    mutate(statistic = paste0(round(mean, 2), " (", round(sd, 2), ")"),
+           !!trt_var := paste(quo_name(trt_var), !!trt_var)) %>%
+    select(-mean, -sd) %>%
+    pivot_wider(names_from = quo_name(trt_var), values_from = statistic)
+}
+
+df %>% 
+  select(contains("trt")) %>% 
+  colnames() %>%
+  map(~get_summary_stats(df, !!sym(.))) %>%
+  bind_cols() %>%
+  select(1:3, 5:6, 8:9, 11:12, 14:15, 17:18) %>%
+  clean_names() %>%
+  mutate(history_1 = case_when(
+    history_1 == "medical_history_dia" ~ "Diagnosis of diabetes in the past 24 months",
+    history_1 == "medical_history_sud" ~ "Diagnosis of substance use disorder in the past 24 months",
+    history_1 == "medical_history_hbp" ~ "Diagnosis of high blood pressure in the past 24 months",
+    history_1 == "medical_history_ren" ~ "Diagnosis of renal failure in the past 24 months",
+    history_1 == "medical_history_tum" ~ "Diagnosis of solid tumor in the past 24 months",
+    history_1 == "medical_history_anx" ~ "Diagnosis of anxiety disorder in the past 24 months",
+    history_1 == "medical_history_mood" ~ "Diagnosis of other mood disorders in the past 24 months")) %>%
+  rename(History = history_1) %>%
+  gt() %>%
+  tab_spanner(label = "Anxiolytics", columns = contains("anx")) %>%
+  tab_spanner(label = "Anticonvulsants", columns = contains("con")) %>%
+  tab_spanner(label = "Antidepressants", columns = contains("adt")) %>%
+  tab_spanner(label = "SSRI", columns = contains("ssr")) %>%
+  tab_spanner(label = "Psychotherapy", columns = contains("the")) %>%
+  tab_spanner(label = "Other psychiatric medications", columns = contains("oth"))  %>%
+  cols_label(
+    ends_with("0") ~ "No",
+    ends_with("1") ~ "Yes",
+  ) %>%
+  tab_source_note(source_note = "Mean and standard deviation (in parentheses) of medical history indicators by treatment class")
+```
+ 
+### Similarly, no particular class of treatment is predominantly used given patients' symptoms. 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+get_summary_stats <- function(df, trt_var) {
+  trt_var <- enquo(trt_var)
+  
+  df %>%
+    group_by(!!trt_var) %>%
+    summarise(across(contains("symptom"), list(mean = ~mean(., na.rm = TRUE), sd = ~sd(., na.rm = TRUE)),
+                     .names = "{col}_{fn}")) %>%
+    ungroup() %>%
+    pivot_longer(cols = -!!trt_var, names_to = c("symptom", ".value"), names_pattern = "(.+)_(.+)$")  %>%
+    mutate(statistic = paste0(round(mean, 2), " (", round(sd, 2), ")"),
+           !!trt_var := paste(quo_name(trt_var), !!trt_var)) %>%
+    select(-mean, -sd) %>%
+    pivot_wider(names_from = quo_name(trt_var), values_from = statistic)
+}
+
+df %>% 
+  select(contains("trt")) %>% 
+  colnames() %>%
+  map(~get_summary_stats(df, !!sym(.))) %>%
+  bind_cols() %>%
+  select(1:3, 5:6, 8:9, 11:12, 14:15, 17:18) %>%
+  clean_names() %>%
+  mutate(symptom_1 = case_when(
+    symptom_1 == "symptom_1" ~ "Current presence of abnormal sleep patterns",
+    symptom_1 == "symptom_2" ~ "Current presence of anhedonia",
+    symptom_1 == "symptom_3" ~ "Current ppoor appetite",
+    symptom_1 == "symptom_4" ~ "Currently feeling depressed or hopeless",
+    symptom_1 == "symptom_5" ~ "Current presence of suicidal thoughts")) %>%
+  rename(Symptom_1 = symptom_1) %>%
+  gt() %>%
+  tab_spanner(label = "Anxiolytics", columns = contains("anx")) %>%
+  tab_spanner(label = "Anticonvulsants", columns = contains("con")) %>%
+  tab_spanner(label = "Antidepressants", columns = contains("adt")) %>%
+  tab_spanner(label = "SSRI", columns = contains("ssr")) %>%
+  tab_spanner(label = "Psychotherapy", columns = contains("the")) %>%
+  tab_spanner(label = "Other psychiatric medications", columns = contains("oth"))  %>%
+  cols_label(
+    ends_with("0") ~ "No",
+    ends_with("1") ~ "Yes",
+  ) %>%  
+  tab_source_note(source_note = "Mean and standard deviation (in parentheses) of symptoms by treatment class")
+
+```
+
+### I use a regression-based strategy to uncover whether the use of other lines of treatment in addition to the use of antidepressants is associated with improved patient outcomes. 
+  - My preferred specification takes the form of a Chow test, where the interaction term between antidepressants and all other treatments can be interpreted as the incremental gains associated with multiple lines of treatment.
+ - The outcomes of interest are CGIS scores at the point of discharge, length of stay, and billing amount. 
+ - I control for medical history, gender, age and CGIS scores at the point of admission, all of which could affect the outcome variables independently of treatment. 
+ - Formally, the regression specification is:
+
+\[ \begin{equation} \text{Outcome}_{i} = \beta_0 + \beta_1Antidepressants + \beta_2Controls + \sum_{i=1}^{5}\gamma_i \text{Other treatments}_{i} + \sum_{q=1}^{5}\gamma_q \text{Antidepressants}_{q} \text{Other treatments}_{i} + \varepsilon_{i} \end{equation} \]  
+
+Where: 
+
+ - Gamma_q is the main variable of interest, capturing the incremental effect of using antidepressants alongside any other lines of treatments. 
+ 
+ The model can be further extended to test for other interactions between treatment pairs, or even higher-order interactions between treatments. 
+
+```{r, include = FALSE, warning=FALSE, message=FALSE}
+trt_str <- df %>% select(contains("trt")) %>% colnames() %>% paste(collapse = "+")
+
+trt_itr <- df %>% select(contains("trt")) %>% select(-contains("adt")) %>% colnames() %>% paste(collapse = "*trt_adt + ")  %>% paste("*trt_adt")
+ 
+controls_str <- df %>% select(contains("history"), age, gender, cgis_adm) %>% colnames() %>% paste(collapse = "+")
+
+reg1 <- 
+formula(paste0("length_of_stay ~", trt_str, "+", trt_itr, "+" , controls_str)) %>%
+  lm(df) %>%
+  tidy() %>%
+  filter(str_detect(term, "trt") | str_detect(term, "Intercept")) %>%
+  mutate(term = str_replace_all(term, "trt_anx", "Anxiolytics"),
+         term = str_replace_all(term, "trt_con", "Anticonvulsants"),
+         term = str_replace_all(term, "trt_adt", "Antidepressants"),
+         term = str_replace_all(term, "trt_ssr", "SSRI"),
+         term = str_replace_all(term, "trt_the", "Psychotherapy"),
+         term = str_replace_all(term, "trt_oth", "Other psychiatric medications"))
+
+reg2 <- 
+formula(paste0("cgis_dis ~", trt_str, "+", trt_itr, "+" , controls_str)) %>%
+  lm(df) %>%
+  tidy() %>%
+  filter(str_detect(term, "trt") | str_detect(term, "Intercept")) %>%
+  mutate(term = str_replace_all(term, "trt_anx", "Anxiolytics"),
+         term = str_replace_all(term, "trt_con", "Anticonvulsants"),
+         term = str_replace_all(term, "trt_adt", "Antidepressants"),
+         term = str_replace_all(term, "trt_ssr", "SSRI"),
+         term = str_replace_all(term, "trt_the", "Psychotherapy"),
+         term = str_replace_all(term, "trt_oth", "Other psychiatric medications"))
+
+reg3 <- 
+formula(paste0("amount ~", trt_str, "+", trt_itr, "+" , controls_str)) %>%
+  lm(df) %>%
+  tidy() %>%
+  filter(str_detect(term, "trt") | str_detect(term, "Intercept")) %>%
+  mutate(term = str_replace_all(term, "trt_anx", "Anxiolytics"),
+         term = str_replace_all(term, "trt_con", "Anticonvulsants"),
+         term = str_replace_all(term, "trt_adt", "Antidepressants"),
+         term = str_replace_all(term, "trt_ssr", "SSRI"),
+         term = str_replace_all(term, "trt_the", "Psychotherapy"),
+         term = str_replace_all(term, "trt_oth", "Other psychiatric medications"))
+```
+
+### Psychotherapy alone is associated with substantially smaller bill amounts (-2,681). 
+ - However, that reduction in bill amounts is negated when psychotherapy is done in conjunction with SSRIs (-2,681 + 2,727)
+ - None of the other results are statistically significant at conventional levels. Directionally, the pairing of SSRIs and other antidepressants are associated with lower lengths of stay (-0.1 days) and lower CGIS scores (-0.15). This could present an avenue for further research. 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+huxreg(
+  "Length of Stay" = reg1, 
+  "CGIS discharge" = reg2, 
+  "Bill amount" = reg3, 
+  statistics = c("R squared" = "r.squared"),
+  note = "{stars}. Robust standard errors in brackets.") %>%
+  insert_row("Controls for medical history, gender, age and CGIS scores at the point of admission", "Yes", "Yes", "Yes", after = nrow(.) - 1) %>%
+  set_bold(1, everywhere) 
+```
+
+### Limitations and extensions 
+
+ - A longer period of observation will allow for us to better observe the effect of multiple lines of therapy, through several channels. First, we could observe longer-term outcomes such as re-admission rates. Second, we could explore changes in treatment for the same individual over time. This may also allow for alternate models such as those which which control for individual fixed effects. 
+ - Better classification of drug data will allow us to construct features for treatment intensity and possibly even sequencing of treatments. 
+ - The coverage of real-world data provide generality to a broad cross-section of the population and reflects actual prescribing practices. This study therefore fills gaps on pharmacological treatment patterns of patients diagnosed with MDD and the role that adjunctive therapy plays.
+ 
